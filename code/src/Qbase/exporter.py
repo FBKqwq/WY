@@ -38,3 +38,18 @@ def export_schedule(
     with pd.ExcelWriter(out_path, engine="openpyxl") as w:
         df.to_excel(w, sheet_name=detail_sheet_name, index=False)
         summary.to_excel(w, sheet_name="汇总", index=False)
+
+
+def export_purchase_plan(
+    rows: list[dict],
+    out_path: str | Path,
+    total_cost: int,
+) -> None:
+    """导出问题4表5购买方案。"""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(rows)
+    summary = pd.DataFrame([{"购买设备总费用(元)": int(total_cost)}])
+    with pd.ExcelWriter(out_path, engine="openpyxl") as w:
+        df.to_excel(w, sheet_name="表5_购买方案", index=False)
+        summary.to_excel(w, sheet_name="汇总", index=False)

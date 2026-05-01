@@ -185,3 +185,27 @@ def solve_problem2(
     当前采用与问题1一致的贪心事件推进框架。
     """
     return solve_problem1(expanded_ops, devices, dist_map)
+
+
+def solve_problem3(
+    expanded_ops: List[ExpandedOperation],
+    devices: List[Device],
+    dist_map: Dict[Tuple[str, str], float],
+) -> Tuple[List[ScheduleRecord], int]:
+    """
+    问题 3：使用班组 1 和班组 2 设备，覆盖 A-E 五个车间。
+    当前采用与问题1一致的贪心事件推进框架。
+    """
+    return solve_problem1(expanded_ops, devices, dist_map)
+
+
+def solve_problem4(
+    expanded_ops: List[ExpandedOperation],
+    devices: List[Device],
+    dist_map: Dict[Tuple[str, str], float],
+) -> Tuple[List[ScheduleRecord], int]:
+    """
+    问题 4：在给定设备集合（含增购设备）下进行调度。
+    复用问题1的贪心事件推进框架，由调用方负责搜索增购方案。
+    """
+    return solve_problem1(expanded_ops, devices, dist_map)

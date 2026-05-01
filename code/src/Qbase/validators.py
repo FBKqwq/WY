@@ -142,5 +142,8 @@ def validate_schedule(
     return "\n".join(sections)
 
 
-def validate_budget(*args, **kwargs) -> List[str]:
-    return []
+def validate_budget(total_cost: int, budget_limit: int) -> List[str]:
+    errs: List[str] = []
+    if total_cost > budget_limit:
+        errs.append(f"预算超限: 总费用 {total_cost} > 预算 {budget_limit}")
+    return errs
