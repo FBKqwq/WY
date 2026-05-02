@@ -115,6 +115,11 @@ def detect_repeat_count(cell_value, row_text: str = "") -> int:
     merged = f"{cell_value if cell_value is not None else ''} {row_text or ''}"
     merged_norm = str(merged)
 
+    # 「重复3遍」赛题附件常见写法（与「重复3次」并列）
+    m = re.search(r"重复\s*(\d+)\s*[遍次]", merged_norm)
+    if m:
+        return max(1, int(m.group(1)))
+
     m = re.search(r"(?:重复|执行)?\s*(\d+)\s*次", merged_norm)
     if m:
         return max(1, int(m.group(1)))

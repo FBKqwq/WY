@@ -126,19 +126,29 @@ def parse_operations(df: pd.DataFrame) -> List[RawOperation]:
                 )
             )
 
-        # 处理 “C3-C5 重复3遍” 这类区间备注
+        # 处理「C3-C5」区间 +「重复N遍/次」类备注（避免误匹配「完成1遍」中的 1）
         if c_note:
             for _, row in df.iterrows():
                 if pd.isna(row.get(c_note)):
                     continue
                 note = str(row[c_note])
-                m_rng = re.search(r"([A-E]\d+)\s*-\s*([A-E]\d+).*?(重复|再进行)?\s*([0-9]+|[一二两三四五六七八九十]+)\s*(遍|次)", note)
-                if not m_rng:
+                m_pair = re.search(r"([A-E]\d+)\s*-\s*([A-E]\d+)", note)
+                if not m_pair:
                     continue
-                left, right = m_rng.group(1), m_rng.group(2)
-                rep = detect_repeat_count(m_rng.group(4), note)
+                left, right = m_pair.group(1), m_pair.group(2)
                 lo, hi = int(re.sub(r"\D", "", left)), int(re.sub(r"\D", "", right))
                 ws = left[0]
+                m_rep_bian = re.search(r"重复\s*(\d+)\s*[遍次]", note)
+                if m_rep_bian:
+                    rep = max(1, int(m_rep_bian.group(1)))
+                else:
+                    m_rng = re.search(
+                        r"([A-E]\d+)\s*-\s*([A-E]\d+).*?(重复|再进行)\s*([0-9]+|[一二两三四五六七八九十]+)\s*(遍|次)",
+                        note,
+                    )
+                    if not m_rng:
+                        continue
+                    rep = detect_repeat_count(m_rng.group(4), note)
                 for r in rows:
                     if r.workshop == ws and lo <= r.order <= hi:
                         r.repeat_count = max(r.repeat_count, rep)

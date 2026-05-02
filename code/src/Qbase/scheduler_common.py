@@ -1,8 +1,9 @@
-"""贪心事件推进调度（问题 1/2 等可复用）。"""
+"""调度求解（问题 1 为枚举+门限最优；问题 2/3 等复用同一入口时为可行解框架）。"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from itertools import permutations
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .parsers import Device, ExpandedOperation, distance_between
 from .time_utils import calc_transport_time, calc_work_duration
@@ -58,13 +59,29 @@ def solve_problem1(
     expanded_ops: List[ExpandedOperation],
     devices: List[Device],
     dist_map: Dict[Tuple[str, str], float],
+    workshop_order: Optional[Sequence[str]] = None,
 ) -> Tuple[List[ScheduleRecord], int]:
     """
     问题 1：仅班组 1、仅指定车间工序（调用方已筛选）。
     返回 (设备任务记录, makespan 秒)。
+
+    对单车间、工序顺序固定的典型 Q1（如仅 A 且设备类型不在后续工序复用），
+    通过枚举并联台数并在固定台数下取门限最小的设备组，可得该链路上 Makespan 的全局最优解。
+
+    workshop_order：多车间时外层按此顺序依次处理「各车间整条工序链」（再进入车间内顺序）；
+    为 None 时等价于车间名字典序，与历史行为一致。
     """
-    # 仅保留传入工序涉及车间（问题1通常为 A）
-    workshops = sorted({op.workshop for op in expanded_ops})
+    ws_in_ops = {op.workshop for op in expanded_ops}
+    if workshop_order is None:
+        workshops = sorted(ws_in_ops)
+    else:
+        order_list = list(workshop_order)
+        if set(order_list) != ws_in_ops:
+            raise ValueError(f"workshop_order 与工序涉及车间集合不一致: 给定={set(order_list)} 需要={ws_in_ops}")
+        if len(order_list) != len(ws_in_ops):
+            raise ValueError("workshop_order 长度须等于涉及车间数且不得重复")
+        workshops = order_list
+
     workshop_ready = {w: 0 for w in workshops}
 
     dev_states = {d.device_id: DeviceState(device=d, location=d.initial_location) for d in devices}
@@ -220,24 +237,59 @@ def solve_problem2(
     expanded_ops: List[ExpandedOperation],
     devices: List[Device],
     dist_map: Dict[Tuple[str, str], float],
+    enumerate_workshop_orders: bool = True,
 ) -> Tuple[List[ScheduleRecord], int]:
     """
     问题 2：仅班组 1，覆盖 A-E 五个车间（调用方可先过滤班组）。
-    当前采用与问题1一致的贪心事件推进框架。
+    与问题 1 共用 `solve_problem1`：含工序内同类多台并联与双设备 (n_1, n_2) 台数枚举。
+
+    enumerate_workshop_orders 为 True（默认）时，枚举「涉及车间」的全排列作为外层处理顺序，
+    取 makespan 最短的贪心解，避免固定字典序车间块顺序造成的明显遗漏；仍为启发式（块内仍整车间串行）。
+    为 False 时与历史一致，外层顺序为车间名字典序。
     """
-    return solve_problem1(expanded_ops, devices, dist_map)
+    ws_tuple = tuple(sorted({op.workshop for op in expanded_ops}))
+    if not enumerate_workshop_orders or len(ws_tuple) <= 1:
+        return solve_problem1(expanded_ops, devices, dist_map, workshop_order=None)
+
+    best_records: Optional[List[ScheduleRecord]] = None
+    best_ms = 10**18
+    for perm in permutations(ws_tuple):
+        rec, ms = solve_problem1(expanded_ops, devices, dist_map, workshop_order=list(perm))
+        if ms < best_ms:
+            best_ms = ms
+            best_records = rec
+    assert best_records is not None
+    return best_records, best_ms
 
 
 def solve_problem3(
     expanded_ops: List[ExpandedOperation],
     devices: List[Device],
     dist_map: Dict[Tuple[str, str], float],
+    enumerate_workshop_orders: bool = True,
 ) -> Tuple[List[ScheduleRecord], int]:
     """
     问题 3：使用班组 1 和班组 2 设备，覆盖 A-E 五个车间。
-    当前采用与问题1一致的贪心事件推进框架。
+    与问题 1/2 共用 `solve_problem1`：调用方传入两班组并池后的 `devices` 列表后，
+    对每道工序枚举同类并联台数 n 及双设备 (n_1, n_2)，门限选机可跨班组挑选同型机；
+    表 3 通过 `include_team=True` 区分设备所属班组。
+
+    enumerate_workshop_orders 为 True（默认）时，与问题 2 相同，枚举涉及车间的全排列作为
+    外层车间块处理顺序，取 makespan 最短的贪心解；仍为启发式（块内整车间链串行，弱于 CP-SAT 跨车间并行）。
     """
-    return solve_problem1(expanded_ops, devices, dist_map)
+    ws_tuple = tuple(sorted({op.workshop for op in expanded_ops}))
+    if not enumerate_workshop_orders or len(ws_tuple) <= 1:
+        return solve_problem1(expanded_ops, devices, dist_map, workshop_order=None)
+
+    best_records: Optional[List[ScheduleRecord]] = None
+    best_ms = 10**18
+    for perm in permutations(ws_tuple):
+        rec, ms = solve_problem1(expanded_ops, devices, dist_map, workshop_order=list(perm))
+        if ms < best_ms:
+            best_ms = ms
+            best_records = rec
+    assert best_records is not None
+    return best_records, best_ms
 
 
 def solve_problem4(
@@ -247,6 +299,7 @@ def solve_problem4(
 ) -> Tuple[List[ScheduleRecord], int]:
     """
     问题 4：在给定设备集合（含增购设备）下进行调度。
-    复用问题1的贪心事件推进框架，由调用方负责搜索增购方案。
+    与问题 3 一致：枚举涉及车间的处理顺序全排列，在内层 `solve_problem1` 上取最短贪心 Makespan；
+    含工序内同类并联与双设备 (n1,n2) 枚举。由调用方搜索增购方案并扩展 `devices`。
     """
-    return solve_problem1(expanded_ops, devices, dist_map)
+    return solve_problem3(expanded_ops, devices, dist_map, enumerate_workshop_orders=True)
