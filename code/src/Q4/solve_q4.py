@@ -7,7 +7,7 @@ import sys
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 # 将 src 加入路径以便导入 Qbase
 _SRC = Path(__file__).resolve().parents[1]
@@ -70,6 +70,24 @@ def _expand_devices_with_purchase(
     return out
 
 
+def _frozen_counts(purchase_counts: Dict[Tuple[int, str], int]) -> Tuple[Tuple[Tuple[int, str], int], ...]:
+    return tuple(sorted((k, int(v)) for k, v in purchase_counts.items() if v > 0))
+
+
+def _evaluate_plan(
+    expanded,
+    base_devices: List[Device],
+    purchase_counts: Dict[Tuple[int, str], int],
+    templates: Dict[Tuple[int, str], Device],
+    dist_map,
+) -> Tuple[List, int, int]:
+    """返回 (调度记录, makespan, 购买总费用)。"""
+    devs = _expand_devices_with_purchase(base_devices, purchase_counts, templates)
+    records, ms = solve_problem4(expanded, devs, dist_map)
+    cost = _calc_purchase_cost(purchase_counts, templates)
+    return records, ms, cost
+
+
 def _utilization_by_type(records, devices: List[Device], makespan: int) -> Dict[str, float]:
     if makespan <= 0:
         return {}
@@ -86,60 +104,301 @@ def _utilization_by_type(records, devices: List[Device], makespan: int) -> Dict[
     return util
 
 
+def _greedy_multistart(
+    expanded,
+    base_devices: List[Device],
+    dist_map,
+    budget_limit: int,
+    templates: Dict[Tuple[int, str], Device],
+    bottleneck_types: List[str],
+    max_steps: int,
+) -> Tuple[Dict[Tuple[int, str], int], List, int, int]:
+    """多起点贪心：瓶颈类型顺序轮换，每步在全部 (班组, 类型) 上加购 1 台并调度，直到预算或步数上限。"""
+    all_types = sorted({d.device_type for d in base_devices})
+    orderings: List[List[str]] = []
+    # 高利用率类型优先 + 全类型兜底
+    orderings.append(list(bottleneck_types) + [t for t in all_types if t not in bottleneck_types])
+    orderings.append(list(all_types))
+    for rot in range(min(5, len(bottleneck_types))):
+        orderings.append(bottleneck_types[rot:] + bottleneck_types[:rot] + [t for t in all_types if t not in bottleneck_types])
+
+    best_pc: Dict[Tuple[int, str], int] = {}
+    best_records: List = []
+    best_ms = 10**18
+    best_cost = 0
+
+    for type_order in orderings:
+        purchase_counts: Dict[Tuple[int, str], int] = defaultdict(int)
+        records, ms, _cost0 = _evaluate_plan(
+            expanded, base_devices, dict(purchase_counts), templates, dist_map
+        )
+        cost = 0
+        cur_records, cur_ms, cur_cost = records, ms, cost
+
+        for _ in range(max_steps):
+            step_best: Optional[Tuple[int, int, Tuple[int, str], Dict, List]] = None
+            for dtype in type_order:
+                for team in (1, 2):
+                    key = (team, dtype)
+                    if key not in templates:
+                        continue
+                    unit_cost = int(round(templates[key].price))
+                    if cur_cost + unit_cost > budget_limit:
+                        continue
+                    trial = dict(purchase_counts)
+                    trial[key] = trial.get(key, 0) + 1
+                    rec, m, c = _evaluate_plan(expanded, base_devices, trial, templates, dist_map)
+                    cand = (m, c, key, trial, rec)
+                    if step_best is None or (cand[0], cand[1]) < (step_best[0], step_best[1]):
+                        step_best = cand
+            if step_best is None:
+                break
+            m, c, _key, trial, rec = step_best
+            if m >= cur_ms:
+                break
+            purchase_counts = defaultdict(int, trial)
+            cur_records, cur_ms, cur_cost = rec, m, c
+
+        if (cur_ms, cur_cost) < (best_ms, best_cost):
+            best_ms, best_cost = cur_ms, cur_cost
+            best_records = cur_records
+            best_pc = dict(purchase_counts)
+
+    return dict(best_pc), best_records, best_ms, best_cost
+
+
+def _dfs_evaluate_purchases(
+    expanded,
+    base_devices: List[Device],
+    dist_map,
+    budget_limit: int,
+    templates: Dict[Tuple[int, str], Device],
+    keys: List[Tuple[int, str]],
+    unit_costs: List[int],
+    idx: int,
+    budget_left: int,
+    counts: List[int],
+    max_total_machines: int,
+    current_total: int,
+    best_holder: List,  # [best_pc dict, best_ms, best_cost, best_records]
+) -> None:
+    """DFS 叶节点直接调度评估，仅更新全局最优（不缓存全部叶节点，避免内存与时间爆炸）。"""
+    if idx == len(keys):
+        pc = {keys[i]: counts[i] for i in range(len(keys)) if counts[i] > 0}
+        rec, ms, cost = _evaluate_plan(expanded, base_devices, pc, templates, dist_map)
+        if best_holder[0] is None or (ms, cost) < (best_holder[1], best_holder[2]):
+            best_holder[0] = dict(pc)
+            best_holder[1] = ms
+            best_holder[2] = cost
+            best_holder[3] = rec
+        return
+    if current_total > max_total_machines:
+        return
+    price = unit_costs[idx]
+    max_c = min(budget_left // price, max_total_machines - current_total) if price > 0 else 0
+    for c in range(0, max_c + 1):
+        counts[idx] = c
+        spend = c * price
+        _dfs_evaluate_purchases(
+            expanded,
+            base_devices,
+            dist_map,
+            budget_limit,
+            templates,
+            keys,
+            unit_costs,
+            idx + 1,
+            budget_left - spend,
+            counts,
+            max_total_machines,
+            current_total + c,
+            best_holder,
+        )
+    counts[idx] = 0
+
+
+def _beam_search_purchase(
+    expanded,
+    base_devices: List[Device],
+    dist_map,
+    budget_limit: int,
+    templates: Dict[Tuple[int, str], Device],
+    seed_states: Iterable[Tuple[Dict[Tuple[int, str], int], List, int, int]],
+    beam_width: int,
+    max_layers: int,
+) -> Tuple[Dict[Tuple[int, str], int], List, int, int]:
+    """
+    束搜索：每层从当前束中尝试每种 (班组, 类型) 加购 1 台，按 (makespan, cost) 保留若干状态。
+    排序时在同 makespan 下保留 cost 更小者（剩余预算更大），利于后续继续加购。
+    """
+    keys = sorted(templates.keys())
+    beam: List[Tuple[Dict[Tuple[int, str], int], List, int, int]] = list(seed_states)
+    if not beam:
+        rec0, ms0, c0 = _evaluate_plan(expanded, base_devices, {}, templates, dist_map)
+        beam = [({}, rec0, ms0, c0)]
+
+    def _sort_key(item: Tuple[Dict, List, int, int]) -> Tuple[int, int]:
+        _pc, _r, ms, cost = item
+        return (ms, cost)
+
+    best = min(beam, key=_sort_key)
+
+    for _layer in range(max_layers):
+        children: List[Tuple[Dict[Tuple[int, str], int], List, int, int]] = []
+        for purchase_counts, _rec, ms, cost in beam:
+            for key in keys:
+                unit = int(round(templates[key].price))
+                if cost + unit > budget_limit:
+                    continue
+                trial = defaultdict(int, purchase_counts)
+                trial[key] += 1
+                trial_d = dict(trial)
+                rec, m, c = _evaluate_plan(expanded, base_devices, trial_d, templates, dist_map)
+                children.append((trial_d, rec, m, c))
+
+        if not children:
+            break
+
+        children.sort(key=_sort_key)
+        seen: Set[Tuple[Tuple[Tuple[int, str], int], ...]] = set()
+        new_beam: List[Tuple[Dict, List, int, int]] = []
+        for item in children:
+            fn = _frozen_counts(item[0])
+            if fn in seen:
+                continue
+            seen.add(fn)
+            new_beam.append(item)
+            if len(new_beam) >= beam_width:
+                break
+
+        cand_best = min(new_beam, key=_sort_key)
+        if _sort_key(cand_best) < _sort_key(best):
+            best = cand_best
+        beam = new_beam
+
+    return best
+
+
+def _hill_climb_add(
+    expanded,
+    base_devices: List[Device],
+    dist_map,
+    budget_limit: int,
+    templates: Dict[Tuple[int, str], Device],
+    purchase_counts: Dict[Tuple[int, str], int],
+    records: List,
+    makespan: int,
+    cost: int,
+) -> Tuple[Dict[Tuple[int, str], int], List, int, int]:
+    """在预算内反复尝试任意位置 +1 台，直到单步无法严格缩短工期。"""
+    keys = sorted(templates.keys())
+    pc = defaultdict(int, purchase_counts)
+    cur_r, cur_ms, cur_c = records, makespan, cost
+    improved = True
+    while improved:
+        improved = False
+        for key in keys:
+            unit = int(round(templates[key].price))
+            if cur_c + unit > budget_limit:
+                continue
+            trial = dict(pc)
+            trial[key] = trial.get(key, 0) + 1
+            rec, m, c = _evaluate_plan(expanded, base_devices, trial, templates, dist_map)
+            if m < cur_ms or (m == cur_ms and c < cur_c):
+                pc = defaultdict(int, trial)
+                cur_r, cur_ms, cur_c = rec, m, c
+                improved = True
+                break
+    return dict(pc), cur_r, cur_ms, cur_c
+
+
 def _search_purchase_plan(
     expanded,
     base_devices: List[Device],
     dist_map,
     budget_limit: int,
 ) -> Tuple[Dict[Tuple[int, str], int], List, int, int]:
-    # 基准（不购买）用于识别瓶颈设备类型
     baseline_records, baseline_makespan = solve_problem3(expanded, base_devices, dist_map)
     util = _utilization_by_type(baseline_records, base_devices, baseline_makespan)
-    bottleneck_types = sorted(util.keys(), key=lambda t: util[t], reverse=True)[:4]
+    bottleneck_types = sorted(util.keys(), key=lambda t: util[t], reverse=True)
     if not bottleneck_types:
         bottleneck_types = sorted({d.device_type for d in base_devices})
 
     templates = _build_device_template(base_devices)
-    purchase_counts: Dict[Tuple[int, str], int] = defaultdict(int)
-    best_records = baseline_records
-    best_makespan = baseline_makespan
-    best_cost = 0
+    keys = sorted(templates.keys())
+    unit_costs = [int(round(templates[k].price)) for k in keys]
 
-    # 逐步贪心加购：每一步尝试给某个班组某类设备 +1，选择工期改善最大的动作
-    for _step in range(12):
-        step_best = None  # (makespan, cost, team, dtype, records)
-        current_cost = _calc_purchase_cost(purchase_counts, templates)
-        for dtype in bottleneck_types:
-            for team in (1, 2):
-                key = (team, dtype)
-                if key not in templates:
-                    continue
-                unit_cost = int(round(templates[key].price))
-                if current_cost + unit_cost > budget_limit:
-                    continue
-                trial = dict(purchase_counts)
-                trial[key] = trial.get(key, 0) + 1
-                devs = _expand_devices_with_purchase(base_devices, trial, templates)
-                records, ms = solve_problem4(expanded, devs, dist_map)
-                cost = _calc_purchase_cost(trial, templates)
-                cand = (ms, cost, team, dtype, trial, records)
-                if step_best is None or (cand[0], cand[1]) < (step_best[0], step_best[1]):
-                    step_best = cand
+    # 1) 枚举：总增购台数不超过上界时遍历全部预算可行组合（叶上直接调度）
+    # 增购总台数上界：与 50 万预算、最便宜单价组合后约 14 台；枚举 8 台内可覆盖主要组合且控制运行时间
+    max_machines = 8
+    best_holder: List = [None, 10**18, 10**18, baseline_records]
+    _dfs_evaluate_purchases(
+        expanded,
+        base_devices,
+        dist_map,
+        budget_limit,
+        templates,
+        keys,
+        unit_costs,
+        0,
+        budget_limit,
+        [0] * len(keys),
+        max_machines,
+        0,
+        best_holder,
+    )
+    best_pc = dict(best_holder[0]) if best_holder[0] is not None else {}
+    best_ms = int(best_holder[1]) if best_holder[0] is not None else baseline_makespan
+    best_cost = int(best_holder[2]) if best_holder[0] is not None else 0
+    best_records = best_holder[3]
 
-        if step_best is None:
-            break
-        ms, cost, team, dtype, trial, records = step_best
-        # 若本步无法改进工期，则停止迭代
-        if ms >= best_makespan:
-            break
-        purchase_counts = defaultdict(int, trial)
-        best_records = records
-        best_makespan = ms
-        best_cost = cost
-        if best_cost >= budget_limit:
-            break
+    # 2) 束搜索：从「不购买」与「枚举层最优」出发扩展（层内会生成大量近邻）
+    seeds: List[Tuple[Dict[Tuple[int, str], int], List, int, int]] = [
+        ({}, baseline_records, baseline_makespan, 0),
+        (dict(best_pc), best_records, best_ms, best_cost),
+    ]
+    beam_pc, beam_rec, beam_ms, beam_cost = _beam_search_purchase(
+        expanded,
+        base_devices,
+        dist_map,
+        budget_limit,
+        templates,
+        seeds,
+        beam_width=72,
+        max_layers=28,
+    )
+    if (beam_ms, beam_cost) < (best_ms, best_cost):
+        best_pc, best_records, best_ms, best_cost = beam_pc, beam_rec, beam_ms, beam_cost
 
-    return dict(purchase_counts), best_records, best_makespan, best_cost
+    # 3) 多起点贪心（与束搜索互补）
+    g_pc, g_rec, g_ms, g_cost = _greedy_multistart(
+        expanded,
+        base_devices,
+        dist_map,
+        budget_limit,
+        templates,
+        bottleneck_types[:6] if len(bottleneck_types) >= 6 else bottleneck_types,
+        max_steps=18,
+    )
+    if (g_ms, g_cost) < (best_ms, best_cost):
+        best_pc, best_records, best_ms, best_cost = g_pc, g_rec, g_ms, g_cost
+
+    # 4) 爬山：在当前最优上继续尝试加购
+    h_pc, h_rec, h_ms, h_cost = _hill_climb_add(
+        expanded,
+        base_devices,
+        dist_map,
+        budget_limit,
+        templates,
+        best_pc,
+        best_records,
+        best_ms,
+        best_cost,
+    )
+    if (h_ms, h_cost) < (best_ms, best_cost):
+        best_pc, best_records, best_ms, best_cost = h_pc, h_rec, h_ms, h_cost
+
+    return dict(best_pc), best_records, best_ms, best_cost
 
 
 def _build_purchase_rows(
